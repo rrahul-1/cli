@@ -48,6 +48,11 @@ const (
 	mcpMetaKeyServerInfo         = mcpMetaKeyPrefix + "serverInfo"
 )
 
+// mcpResultTypeComplete is the resultType every ordinary modern result
+// carries (clients treat an absent resultType as "complete" only for
+// earlier-protocol servers).
+const mcpResultTypeComplete = "complete"
+
 // mcpCacheScopePublic marks discovery and tools/list results as shareable
 // across clients: their content depends only on the binary, not per-client
 // state.
@@ -442,7 +447,7 @@ func validateModernMeta(meta map[string]json.RawMessage) *mcpError {
 // "complete" only for an earlier-protocol server, so a modern response must
 // state it) and server identity under _meta.
 func mcpModernResultEnvelope(result map[string]any) map[string]any {
-	result["resultType"] = "complete"
+	result["resultType"] = mcpResultTypeComplete
 	result["_meta"] = map[string]any{mcpMetaKeyServerInfo: mcpServerIdentity()}
 	return result
 }
