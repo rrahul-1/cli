@@ -968,7 +968,11 @@ help`, the `entire status` footer points at it, and `entire status --json`
 exposes it as the `agent_help` field. On top of that, Factory AI Droid (which is
 banner-only) gets the pointer appended to its SessionStart hook banner, and
 MCP-host agents can launch the hidden `entire mcp` stdio server, which exposes
-`agent_help` and `entire_status` as MCP tools using the same live rendering.
+`agent_help` and `entire_status` as MCP tools using the same live rendering. It
+speaks both protocol eras: the legacy `initialize` handshake (2025-06-18) and,
+statelessly, the modern 2026-07-28 surface — a `server/discover` probe answers
+with a discovery result, and modern requests carry per-request `_meta` instead
+of a handshake.
 Enabling a no-channel agent with `--agent-help-skill` reports the skill
 unsupported and points the agent at this passive path instead.
 

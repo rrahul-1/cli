@@ -30,6 +30,36 @@ import (
 // request one. We echo the client's requested version when present.
 const mcpProtocolVersion = "2025-06-18"
 
+// mcpModernProtocolVersion is the modern MCP revision (the stateless model of
+// SEP-2575 / the 2026-07-28 specification) whose per-request surface this
+// server additionally speaks alongside the legacy initialize handshake above.
+const mcpModernProtocolVersion = "2026-07-28"
+
+// Per-request _meta keys the modern era requires on every stateless request
+// (validated before serving one), and the key under which modern results
+// report server identity. The io.modelcontextprotocol/ namespace is reserved
+// by the specification, so a legacy client's _meta (e.g. progressToken) never
+// collides with it.
+const (
+	mcpMetaKeyPrefix             = "io.modelcontextprotocol/"
+	mcpMetaKeyProtocolVersion    = mcpMetaKeyPrefix + "protocolVersion"
+	mcpMetaKeyClientInfo         = mcpMetaKeyPrefix + "clientInfo"
+	mcpMetaKeyClientCapabilities = mcpMetaKeyPrefix + "clientCapabilities"
+	mcpMetaKeyServerInfo         = mcpMetaKeyPrefix + "serverInfo"
+)
+
+// mcpCacheScopePublic marks discovery and tools/list results as shareable
+// across clients: their content depends only on the binary, not per-client
+// state.
+const mcpCacheScopePublic = "public"
+
+// mcpCacheTTLMS bounds how long a client may cache a discovery or tools/list
+// result. The tool registry is static for the life of the binary (mcpToolDefs
+// varies only with the installed version), so cacheScope "public" and a
+// five-minute TTL are safe: nothing served here goes stale short of a binary
+// upgrade, which restarts the server anyway.
+const mcpCacheTTLMS = 5 * 60 * 1000
+
 // maxMCPMessageBytes bounds a single newline-delimited JSON-RPC message so a
 // malformed or abusive line can't exhaust memory. 1 MiB is far above any real
 // agent_help / status request.
@@ -74,6 +104,9 @@ type mcpResponse struct {
 type mcpError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	// Data carries structured error detail (e.g. UnsupportedProtocolVersionError's
+	// requested/supported); omitted for the plain legacy errors.
+	Data any `json:"data,omitempty"`
 }
 
 // runMCPServer reads newline-delimited JSON-RPC 2.0 messages from in (one per
@@ -152,11 +185,19 @@ func runMCPServer(ctx context.Context, rootCmd *cobra.Command, in io.Reader, out
 }
 
 func dispatchMCP(ctx context.Context, rootCmd *cobra.Command, method string, params json.RawMessage) (any, *mcpError) {
+	// Era-independent: the legacy handshake and its notification keep their
+	// exact current semantics regardless of metadata.
 	switch method {
 	case "initialize":
 		return mcpInitializeResult(params), nil
 	case "notifications/initialized":
 		return nil, nil // notification; result is ignored by the caller
+	}
+	if isModernMCPRequest(method, params) {
+		return dispatchModernMCP(ctx, rootCmd, method, params)
+	}
+	// Legacy era: unchanged surface.
+	switch method {
 	case "ping":
 		return map[string]any{}, nil
 	case "tools/list":
@@ -181,7 +222,7 @@ func mcpInitializeResult(params json.RawMessage) map[string]any {
 	return map[string]any{
 		"protocolVersion": protocol,
 		"capabilities":    map[string]any{"tools": map[string]any{}},
-		"serverInfo":      map[string]any{"name": mcpServerName, "version": versioninfo.Version},
+		"serverInfo":      mcpServerIdentity(),
 	}
 }
 
@@ -208,7 +249,7 @@ func mcpToolDefs() []map[string]any {
 	}
 }
 
-func handleMCPToolCall(ctx context.Context, rootCmd *cobra.Command, params json.RawMessage) (any, *mcpError) {
+func handleMCPToolCall(ctx context.Context, rootCmd *cobra.Command, params json.RawMessage) (map[string]any, *mcpError) {
 	var call struct {
 		Name      string `json:"name"`
 		Arguments struct {
@@ -259,4 +300,176 @@ func mcpToolErrorResult(text string) map[string]any {
 		"content": []map[string]any{{"type": "text", "text": text}},
 		"isError": true,
 	}
+}
+
+// mcpServerIdentity is the server identity shared by the legacy initialize
+// result and the modern _meta serverInfo, so the two eras can never drift.
+func mcpServerIdentity() map[string]any {
+	return map[string]any{"name": mcpServerName, "version": versioninfo.Version}
+}
+
+// mcpRequestMeta extracts a request's _meta object, reporting whether one was
+// present.
+func mcpRequestMeta(params json.RawMessage) (map[string]json.RawMessage, bool) {
+	if len(params) == 0 {
+		return nil, false
+	}
+	var p struct {
+		Meta map[string]json.RawMessage `json:"_meta"`
+	}
+	if json.Unmarshal(params, &p) != nil {
+		return nil, false
+	}
+	return p.Meta, p.Meta != nil
+}
+
+// isModernMCPRequest reports whether a request (after the era-independent
+// initialize and notifications/initialized) is served with modern stateless
+// semantics. server/discover is modern-only by definition — it is the probe a
+// dual-era client sends before anything else, so it arrives with no
+// per-request metadata at all. Any other request is modern when its _meta
+// carries an io.modelcontextprotocol/ namespaced key: modern clients always
+// send protocolVersion alongside clientInfo and clientCapabilities, and legacy
+// clients never use that reserved namespace — so a namespaced key without a
+// protocolVersion is a malformed modern request to reject (validateModernMeta),
+// not a legacy request to serve.
+func isModernMCPRequest(method string, params json.RawMessage) bool {
+	if method == "server/discover" {
+		return true
+	}
+	meta, ok := mcpRequestMeta(params)
+	if !ok {
+		return false
+	}
+	for key := range meta {
+		if strings.HasPrefix(key, mcpMetaKeyPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// dispatchModernMCP serves a modern 2026-07-28 request statelessly:
+// per-request _meta replaces the initialize handshake, every result states its
+// resultType, and server identity rides in _meta rather than a top-level
+// serverInfo. The tools themselves are the shared registry and execution path
+// the legacy era uses — only the envelope differs.
+func dispatchModernMCP(ctx context.Context, rootCmd *cobra.Command, method string, params json.RawMessage) (any, *mcpError) {
+	meta, _ := mcpRequestMeta(params)
+	// The discovery probe predates client metadata: validate the protocol
+	// version only when the probe carries one. Demanding full client identity
+	// here would break the probe-first flow the method exists to serve.
+	if method == "server/discover" {
+		if _, hasVersion := meta[mcpMetaKeyProtocolVersion]; hasVersion {
+			if err := validateModernProtocolVersion(meta); err != nil {
+				return nil, err
+			}
+		}
+		return mcpDiscoverResult(), nil
+	}
+	if err := validateModernMeta(meta); err != nil {
+		return nil, err
+	}
+	switch method {
+	case "tools/list":
+		return mcpModernToolsListResult(), nil
+	case "tools/call":
+		result, rpcErr := handleMCPToolCall(ctx, rootCmd, params)
+		if rpcErr != nil {
+			return nil, rpcErr
+		}
+		return mcpModernResultEnvelope(result), nil
+	default:
+		// ping is legacy-era only; it does not exist in the modern surface.
+		return nil, &mcpError{Code: -32601, Message: "method not found: " + method}
+	}
+}
+
+// validateModernProtocolVersion checks the per-request protocolVersion. A
+// well-formed but unsupported version gets UnsupportedProtocolVersionError
+// (-32022) with the requested/supported detail the schema requires; a missing
+// or non-string version is invalid params (-32602).
+func validateModernProtocolVersion(meta map[string]json.RawMessage) *mcpError {
+	raw, ok := meta[mcpMetaKeyProtocolVersion]
+	if !ok {
+		return &mcpError{Code: -32602, Message: "invalid params: missing _meta." + mcpMetaKeyProtocolVersion}
+	}
+	var version string
+	if json.Unmarshal(raw, &version) != nil || version == "" {
+		return &mcpError{Code: -32602, Message: "invalid params: _meta." + mcpMetaKeyProtocolVersion + " must be a non-empty string"}
+	}
+	if version != mcpModernProtocolVersion {
+		return &mcpError{
+			Code:    -32022,
+			Message: "unsupported protocol version: " + version,
+			Data:    map[string]any{"requested": version, "supported": []string{mcpModernProtocolVersion}},
+		}
+	}
+	return nil
+}
+
+// validateModernMeta enforces the full per-request metadata the modern era
+// requires on every stateless request beyond the discovery probe:
+// protocolVersion, clientInfo (an object with a string name), and
+// clientCapabilities (an object).
+func validateModernMeta(meta map[string]json.RawMessage) *mcpError {
+	if err := validateModernProtocolVersion(meta); err != nil {
+		return err
+	}
+	raw, ok := meta[mcpMetaKeyClientInfo]
+	if !ok {
+		return &mcpError{Code: -32602, Message: "invalid params: missing _meta." + mcpMetaKeyClientInfo}
+	}
+	var clientInfo struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(raw, &clientInfo) != nil || clientInfo.Name == "" {
+		return &mcpError{Code: -32602, Message: "invalid params: _meta." + mcpMetaKeyClientInfo + " must be an object with a string name"}
+	}
+	raw, ok = meta[mcpMetaKeyClientCapabilities]
+	if !ok {
+		return &mcpError{Code: -32602, Message: "invalid params: missing _meta." + mcpMetaKeyClientCapabilities}
+	}
+	var caps map[string]any
+	if json.Unmarshal(raw, &caps) != nil || caps == nil {
+		return &mcpError{Code: -32602, Message: "invalid params: _meta." + mcpMetaKeyClientCapabilities + " must be an object"}
+	}
+	return nil
+}
+
+// mcpModernResultEnvelope adds the fields every modern result carries: the
+// resultType discriminator (clients may treat an absent resultType as
+// "complete" only for an earlier-protocol server, so a modern response must
+// state it) and server identity under _meta.
+func mcpModernResultEnvelope(result map[string]any) map[string]any {
+	result["resultType"] = "complete"
+	result["_meta"] = map[string]any{mcpMetaKeyServerInfo: mcpServerIdentity()}
+	return result
+}
+
+// mcpDiscoverResult answers the era-detection probe. A successful result is
+// what tells a dual-era client "modern": supportedVersions lists only modern
+// versions the server genuinely implements — advertising a version whose
+// stateless semantics the server does not honor would produce clients that
+// skip initialize and send requests the server rejects. The legacy surface
+// stays reachable through initialize regardless.
+func mcpDiscoverResult() map[string]any {
+	return mcpModernResultEnvelope(map[string]any{
+		"supportedVersions": []string{mcpModernProtocolVersion},
+		"capabilities":      map[string]any{"tools": map[string]any{}},
+		"cacheScope":        mcpCacheScopePublic,
+		"ttlMs":             mcpCacheTTLMS,
+	})
+}
+
+// mcpModernToolsListResult serves the shared tool registry in the modern
+// cacheable envelope. Order is the registry's fixed definition order
+// (deterministic, per the changelog's SHOULD). The legacy surface has no
+// cursor pagination, so none is advertised here either.
+func mcpModernToolsListResult() map[string]any {
+	return mcpModernResultEnvelope(map[string]any{
+		"tools":      mcpToolDefs(),
+		"cacheScope": mcpCacheScopePublic,
+		"ttlMs":      mcpCacheTTLMS,
+	})
 }
